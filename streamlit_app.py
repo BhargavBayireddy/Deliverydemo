@@ -72,10 +72,19 @@ NEGW = set("bad terrible awful worst cold soggy late delay delayed dirty slow ru
 TOX_PAT = re.compile(r"\b(chor|fraud|mc|bc|madarchod|bhenchod|saala|saale|kutte|kutti|bloody|idiot|stupid|poda|podi|paka|thuu|nonsense)\b", re.I)
 
 ASPECTS = {
-    "Food": set(""" food biryani pizza burger rice curry roti dosa idli sambar shawarma roll fries taste spicy cold hot stale raw burnt oily salty sweet chutney sauce portion quantity fresh """.split()),
-    "Delivery": set("delivery rider driver boy courier late delay delayed ontime fast slow call behaviour attitude rude polite location route otp helmet bag vehicle bike app map wrong house address stairs").split(),
-    "App": set("app ui ux payment upi card wallet refund replace cancel cancelled update crash bug otp login coupon promo offer support chat service email ticket").split(),
+    "Food": set("""
+    food biryani pizza burger rice curry roti dosa idli sambar shawarma roll fries taste spicy cold hot stale raw burnt oily salty sweet chutney sauce portion quantity fresh soggy
+    """.split()),
+
+    "Delivery": set("""
+    delivery rider driver boy courier late delay delayed ontime fast slow call behaviour attitude rude polite location route otp helmet bag vehicle bike app map wrong house address stairs
+    """.split()),
+
+    "App": set("""
+    app ui ux payment upi card wallet refund replace cancel cancelled update crash bug otp login coupon promo offer support chat service email ticket
+    """.split()),
 }
+
 
 def tokenize(text: str):
     return re.findall(r"[a-zA-Z]+", text.lower())
