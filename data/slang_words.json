@@ -1,0 +1,16 @@
+{
+  "bokka": {"lang": ["te","te_rom"], "severity": 3, "notes": "Telugu slang"},
+  "puka":  {"lang": ["te","te_rom"], "severity": 4, "notes": "abusive"},
+  "pani":  {"lang": ["te","te_rom","ml","ml_rom"], "severity": 1, "notes": "contextual"},
+  "nayala": {"lang": ["te","te_rom"], "severity": 3, "notes": "abusive"},
+  "bsdk":  {"lang": ["hi","hi_rom"], "severity": 4, "notes": "abusive"},
+  "chutiya": {"lang": ["hi","hi_rom"], "severity": 5, "notes": "abusive"},
+  "madarchod": {"lang": ["hi","hi_rom"], "severity": 5, "notes": "abusive"},
+  "bhosdi": {"lang": ["hi","hi_rom"], "severity": 5, "notes": "abusive"},
+  "saale": {"lang": ["hi","hi_rom"], "severity": 3, "notes": "insult"},
+  "loose": {"lang": ["ta","ta_rom"], "severity": 2, "notes": "insult (Tamil/KA chat)"},
+  "waste fellow": {"lang": ["te","te_rom","en"], "severity": 2, "notes": "insult"},
+  "bloody": {"lang": ["en"], "severity": 2, "notes": "mild abusive"},
+  "fuck": {"lang": ["en"], "severity": 4, "notes": "abusive"},
+  "fucking": {"lang": ["en"], "severity": 4, "notes": "abusive"}
+}
