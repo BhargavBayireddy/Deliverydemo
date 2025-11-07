@@ -339,14 +339,12 @@ with colB:
             return frame
 
         webrtc_ctx = webrtc_streamer(
-            key="mic",
-            mode=WebRtcMode.RECVONLY,
-            audio_receiver_size=1024,
-            rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
-            media_stream_constraints={"video": False, "audio": True},
-            async_processing=True,
-            on_audio_frame=recv_audio,
-        )
+    key="speech",
+    mode=WebRtcMode.SENDONLY,
+    rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+    media_stream_constraints={"audio": True, "video": False},
+)
+
 
         if webrtc_ctx and webrtc_ctx.state.playing:
             status_placeholder.info("🎤 Recording… speak now")
