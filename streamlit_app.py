@@ -1,478 +1,445 @@
 # -*- coding: utf-8 -*-
-# Hybrid NLP Dashboard (Text + Voice) — Indian Languages + Roman chat slang
-# Mode: Version B (full dashboard)
+# 🛵 Delivery Mood Demo — Pan-India NLP + Voice (HF Whisper) + Live Gauge
+# Single-file Streamlit app that runs on Streamlit Cloud (Python 3.11).
+# - Language auto-detect (native scripts + romanized Indic via langid + heuristics)
+# - Sentiment/Emotion/Toxicity via local HF model (export_model/) or rule fallback
+# - Live typing-speed -> Mood Gauge (energy 0–100)
+# - WebRTC mic -> HF Whisper API transcription -> same NLP analysis
+# - Keeps Review box + Delivery Boy Dashboard
 #
-# Features
-# - Auto language detect: native Indic scripts + Roman (Hinglish/Tenglish/Tanglish/Kanglish)
-# - Sentiment + Emotion + Toxicity via HuggingFace Inference API
-# - Slang / bad-words detector with context handling (joke/teasing vs abuse)
-# - Typing-speed → stress gauge
-# - Live voice capture (WebRTC) with waveform + Whisper transcription + prosody emotion
+# SECRETS:
+#   In Streamlit Cloud -> Settings -> Secrets add:
+#     HF_API_TOKEN = "hf_xxxxxxxxxxxxxxxxx"
 #
-# Env: set HF_API_TOKEN in Streamlit secrets
+# REQS (pin these in requirements.txt):
+#   streamlit==1.39.0
+#   streamlit-webrtc==0.47.7
+#   transformers==4.44.2
+#   datasets==3.0.1
+#   torch==2.3.1
+#   langid==1.1.6
+#   numpy==1.26.4
+#   pandas==2.2.3
+#   soundfile==0.12.1
+#   av==12.0.0
+#
+# If export_model/ exists (tokenizer+config+pytorch_model.bin), the app uses it.
+# Otherwise it uses a robust rule-based classifier as fallback.
 
-import io, os, re, json, time, math, queue
-import random
-import requests
+import os, io, re, time, json, math, queue, base64
+from datetime import datetime
 import numpy as np
 import pandas as pd
-from collections import defaultdict, deque
-from datetime import datetime
-
 import streamlit as st
-from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
-import av
+import requests
 
-# Optional helpers
+# ---- optional but safe ----
 try:
-    import fasttext  # for Roman language clue
-    HAS_FASTTEXT = True
+    import langid  # pure-python, good for Romanized guesses too
+    HAS_LANGID = True
 except Exception:
-    HAS_FASTTEXT = False
+    HAS_LANGID = False
 
-from indic_transliteration import sanscript
-from indic_transliteration.sanscript import SchemeMap, SCHEMES, transliterate
+# HF pipeline (optional)
+HF_MODEL_READY = False
+try:
+    from transformers import pipeline
+    if os.path.isdir("export_model"):
+        clf = pipeline("text-classification", model="export_model", tokenizer="export_model", top_k=None)
+        HF_MODEL_READY = True
+    else:
+        clf = None
+except Exception:
+    clf = None
+    HF_MODEL_READY = False
 
-# --------------------------------------------
-# CONFIG
-# --------------------------------------------
-st.set_page_config(page_title="Hybrid NLP (Text + Voice)", page_icon="🛵", layout="wide")
+# ---- WebRTC (mic) ----
+try:
+    from streamlit_webrtc import webrtc_streamer, WebRtcMode
+    import av
+    HAS_WEBRTC = True
+except Exception:
+    HAS_WEBRTC = False
 
-HF_API = "https://api-inference.huggingface.co/models"
-HF_TOKEN = st.secrets.get("HF_API_TOKEN", None)
+st.set_page_config(page_title="Delivery Mood (NLP + Voice)", page_icon="🛵", layout="wide")
 
-# HuggingFace models (stable + free-tier friendly)
-MODELS = dict(
-    sentiment="cardiffnlp/twitter-xlm-roberta-base-sentiment",    # neg/neu/pos (multi-lingual)
-    emotion="j-hartmann/emotion-english-distilroberta-base",      # 7 emotions (works ok cross-lingual too)
-    toxicity="unitary/toxic-bert",                                # toxicity
-    whisper="openai/whisper-small"                                # multilingual ASR
-)
+# ========== Hard-coded slang & cues (Pan-India, compact) ==========
+SLANG_ABUSIVE = set("""
+bokka maddi bekar bakwas ullu kameena kutta chut* l*nd gaandu chutiya ch**ya sala
+poda dei bloody waste idiot bastard suvar* panni puka mosam chindi
+""".split())
+SLANG_FRIENDLY = set("bro anna maga macha machan yaar ra re daa di bruh dude bhaiya thala boss babu".split())
+SLANG_POS = set("keka mass semma super mast thopu vera_level nalla nice awesome".split())
+NEG_CUES = set("late delay dirty slow cold soggy overpriced refund cancel cancelled rude disappointed hate angry worst horrible pathetic".split())
+POS_CUES = set("good great awesome amazing excellent tasty fresh quick yummy clean crisp recommend thanks superb love".split())
 
-# WebRTC TURN/STUN (public Google STUN is OK)
-RTC_CONFIG = RTCConfiguration(
-    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-)
+EMOJI_POS = "😀😃😄😁😆😊😍🤩👍👏✨🔥🥳😌🙂"
+EMOJI_NEG = "😠😡🤬💢😞😟😢😭☹️😒"
+EMOJI_MIX = "🙄😏🤨😐"
 
-# --------------------------------------------
-# LOAD SLANG LEXICON
-# --------------------------------------------
-@st.cache_resource
-def load_slang():
-    path = os.path.join("data", "slang_words.json")
-    if not os.path.exists(path):
-        # Minimal fallback list
-        seed = {
-            "bokka": {"lang": ["te","te_rom"], "severity": 3, "notes": "Telugu slang"},
-            "puka": {"lang": ["te","te_rom"], "severity": 4, "notes": "abusive"},
-            "pani": {"lang": ["te","te_rom"], "severity": 1, "notes": "mild (depends)"},
-            "bhosdi": {"lang": ["hi","hi_rom"], "severity": 5, "notes": "abusive"},
-            "bsdk": {"lang": ["hi","hi_rom"], "severity": 4, "notes": "abusive short"},
-            "fuck": {"lang": ["en"], "severity": 4, "notes": "abusive"},
-            "bloody": {"lang": ["en"], "severity": 2, "notes": "mild"}
-        }
-        return seed
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+ROMAN_HINTS = {
+    "te": ["inka", "chala", "bokka", "ra", "randi", "inka", "enthaa", "ayyoo", "inka fast", "pani", "em", "antava"],
+    "ta": ["dei", "machan", "anna", "podu", "romba", "seri", "sappa", "semma", "mass", "vera level"],
+    "hi": ["bhai", "bahut", "yaar", "nahi", "jaldi", "accha", "bkl", "mc", "bc", "mast", "bekar"],
+    "ml": ["alle", "nalla", "cha", "pani", "eda", "enthe", "entha", "polichu"],
+    "kn": ["maga", "bega", "sari", "swalpa", "eshtu", "madkond", "kannada"],
+}
 
-SLANG = load_slang()
-
-LAUGHTER_TOKENS = {"lol","lmao","haha","hahaha","😂","😅","😆","hehe","rofl"}
-NEGATE_TOKENS = {"no","not","never","mat","kadu","illa","kadhu","illa","venam","vendam","illa","beda"}
-SECOND_PERSON = {"you","nee","nuv","ni","tera","tera","tum","tu","bro","bhai","babu"}
-
-# --------------------------------------------
-# UTILS: HuggingFace Inference
-# --------------------------------------------
-def hf_headers():
-    if not HF_TOKEN:
-        return {}
-    return {"Authorization": f"Bearer {HF_TOKEN}"}
-
-def hf_classify(model, inputs):
-    """
-    Generic HF classification (pipelines return list of dicts).
-    """
-    url = f"{HF_API}/{model}"
-    r = requests.post(url, headers=hf_headers(), json={"inputs": inputs, "options":{"wait_for_model":True}})
-    r.raise_for_status()
-    return r.json()
-
-def hf_asr_whisper(audio_bytes, sampling_rate=16000):
-    """
-    Whisper-small via HF API. Accepts WAV bytes.
-    """
-    url = f"{HF_API}/{MODELS['whisper']}"
-    files = {"file": ("audio.wav", audio_bytes, "audio/wav")}
-    r = requests.post(url, headers=hf_headers(), files=files, data={"task":"transcribe"})
-    r.raise_for_status()
-    js = r.json()
-    # HF returns dict with 'text' or list
-    if isinstance(js, dict) and "text" in js:
-        return js["text"]
-    if isinstance(js, list) and js and "text" in js[0]:
-        return js[0]["text"]
-    return ""
-
-# --------------------------------------------
-# LANGUAGE DETECTION
-# --------------------------------------------
-INDIC_BLOCKS = {
+SCRIPT_RANGES = {
     "hi": (0x0900, 0x097F),  # Devanagari
     "te": (0x0C00, 0x0C7F),  # Telugu
     "ta": (0x0B80, 0x0BFF),  # Tamil
-    "kn": (0x0C80, 0x0CFF),  # Kannada
     "ml": (0x0D00, 0x0D7F),  # Malayalam
+    "kn": (0x0C80, 0x0CFF),  # Kannada
     "bn": (0x0980, 0x09FF),  # Bengali
     "gu": (0x0A80, 0x0AFF),  # Gujarati
-    "pa": (0x0A00, 0x0A7F),  # Gurmukhi (Punjabi)
+    "pa": (0x0A00, 0x0A7F),  # Gurmukhi
     "or": (0x0B00, 0x0B7F),  # Odia
 }
 
-ROMAN_HINTS = dict(
-    te_rom={"entha","sepu","ivvu","ra","naku","anta","bokka","enduku","cheyyali","ekkada","tiffin","nuvvu","telu","aavthundi","late"},
-    hi_rom={"bhai","jaldi","intezar","khana","bhook","der","bekaar","faltu","kya","kab","ghar","bhaiya","bhukkad"},
-    ta_rom={"enna","thambi","saar","seekiram","sapadu","sapadu","seri","podu","ippadi"},
-    kn_rom={"yaako","beka","illi","hegide","thumba","kelsa"},
-    ml_rom={"entha","evide","vannu","poyi","sheri","vada","pani","kochu"}
-)
-
-def detect_script_lang(text):
-    # If any Indic script char → return its language
-    for ch in text:
+def detect_script_lang(s: str) -> str | None:
+    for ch in s:
         cp = ord(ch)
-        for lang, (lo,hi) in INDIC_BLOCKS.items():
-            if lo <= cp <= hi:
+        for lang, (a, b) in SCRIPT_RANGES.items():
+            if a <= cp <= b:
                 return lang
     return None
 
-@st.cache_data(show_spinner=False)
-def load_fasttext_model():
-    if not HAS_FASTTEXT:
-        return None
-    # tiny language id model
-    # Will be downloaded on first use (fastText wheel embeds model path sometimes)
-    return None
+def guess_roman_lang(s: str) -> str:
+    s_low = s.lower()
+    # heuristic by hints
+    scores = {k: 0 for k in ROMAN_HINTS}
+    for lang, hints in ROMAN_HINTS.items():
+        for h in hints:
+            if h in s_low:
+                scores[lang] += 1
+    best = max(scores, key=lambda k: scores[k])
+    if scores[best] > 0:
+        return best
+    # langid fallback
+    if HAS_LANGID:
+        code, _ = langid.classify(s_low)
+        # map en->und for roman-indic
+        if code in {"hi", "te", "ta", "ml", "kn", "bn", "gu", "pa", "ur"}:
+            return code
+    return "en"
 
-def detect_language(text):
-    """
-    Returns ISO-ish code among: te, ta, hi, kn, ml, en, etc.
-    Approach:
-    1) Indic script check
-    2) Roman hint lexicons (priority to te/hi/ta/kn/ml)
-    3) FastText (if available)
-    4) Fallback english/und
-    """
-    txt = text.strip()
-    if not txt:
-        return "und"
-
-    # 1) Indic script
-    lang = detect_script_lang(txt)
-    if lang: return lang
-
-    # 2) Roman hints (score-based)
-    scores = defaultdict(int)
-    tokens = re.findall(r"[a-zA-Z]+", txt.lower())
-    for t in tokens:
-        for lang_key, vocab in ROMAN_HINTS.items():
-            if t in vocab:
-                scores[lang_key] += 2
-        # bonus: Telugu vowel patterns
-        if re.search(r"(ivv|cheyy|sepu|ayya|amma)", t): scores["te_rom"] += 1
-        if re.search(r"(jaldi|bhai|der|khana|nahi)", t): scores["hi_rom"] += 1
-        if re.search(r"(seekiram|sapadu|seri)", t): scores["ta_rom"] += 1
-        if re.search(r"(yaka|beka|illi|hegide)", t): scores["kn_rom"] += 1
-        if re.search(r"(entha|evide|poyi|sheri)", t): scores["ml_rom"] += 1
-    if scores:
-        best = max(scores, key=scores.get)
-        return best.split("_")[0]  # te_rom -> te
-
-    # 3) fastText fallback (optional)
-    # Skipped to avoid large model download on Streamlit Cloud free tier.
-
-    # 4) Fallback
-    if re.search(r"[a-zA-Z]", txt):
-        return "en"
-    return "und"
-
-# --------------------------------------------
-# SLANG / BAD WORDS with CONTEXT
-# --------------------------------------------
-def slang_scan(text, lang_hint="und"):
-    low = text.lower()
-    toks = re.findall(r"\w+", low)
-    hits = []
-    for i, t in enumerate(toks):
-        if t in SLANG:
-            # language check (if provided)
-            entry = SLANG[t]
-            ok = True
-            if "lang" in entry and lang_hint not in ("und","en"):
-                if lang_hint not in entry["lang"]:
-                    ok = False
-            if ok:
-                ctx = toks[max(0,i-3):i+4]
-                joking = any(x in LAUGHTER_TOKENS for x in ctx)
-                neg = any(x in NEGATE_TOKENS for x in ctx)
-                direct = any(x in SECOND_PERSON for x in ctx)
-                sev = int(entry.get("severity", 3))
-                # Context mod
-                if joking: sev -= 1
-                if neg: sev -= 1
-                if direct: sev += 1
-                sev = max(1, min(5, sev))
-                hits.append({"word": t, "context": " ".join(ctx), "severity": sev, "joking": joking, "negated": neg, "directed": direct})
-    # Aggregate decision
-    toxicity_flag = any(h["severity"] >= 3 for h in hits)
-    return hits, toxicity_flag
-
-# --------------------------------------------
-# TEXT → Sentiment / Emotion / Toxicity
-# --------------------------------------------
-def softmax(z):
-    ez = np.exp(z - np.max(z))
-    return ez / ez.sum()
-
-def label_from_hf_scores(res):
-    # HF returns list of list or list; unify
-    arr = res
-    if isinstance(res, list) and len(res)>0 and isinstance(res[0], dict) and "label" in res[0]:
-        arr = [res]
-    # pick top label
-    top = sorted(arr[0], key=lambda x: -float(x.get("score",0)))[:1][0]
-    return top["label"], float(top["score"])
-
-def classify_text_all(text):
+def auto_language(text: str) -> str:
     if not text.strip():
-        return dict(sentiment=("NEU", 0.5), emotion=("neutral", 0.5), toxicity=("no", 0.5))
-    out = {}
-    # Sentiment
-    try:
-        r = hf_classify(MODELS["sentiment"], text)
-        lab, sc = label_from_hf_scores(r)
-        # normalize to NEG/NEU/POS
-        out["sentiment"] = (lab.upper(), sc)
-    except Exception:
-        out["sentiment"] = ("NEU", 0.33)
-    # Emotion
-    try:
-        r = hf_classify(MODELS["emotion"], text)
-        lab, sc = label_from_hf_scores(r)
-        out["emotion"] = (lab.lower(), sc)
-    except Exception:
-        out["emotion"] = ("neutral", 0.33)
-    # Toxicity (model-level)
-    try:
-        r = hf_classify(MODELS["toxicity"], text)
-        lab, sc = label_from_hf_scores(r)
-        tox_yes = lab.lower() in ("toxic","LABEL_1","abusive")
-        out["toxicity"] = ("yes" if tox_yes else "no", sc)
-    except Exception:
-        out["toxicity"] = ("no", 0.33)
-    return out
+        return "und"
+    native = detect_script_lang(text)
+    if native:
+        return native
+    # roman
+    return guess_roman_lang(text)
 
-# --------------------------------------------
-# TYPING SPEED → Mood gauge
-# --------------------------------------------
-def typing_speed_update():
-    # keep last length/time in session
+# ========== Rule Sentiment/Emotion/Toxicity (fallback) ==========
+def rule_classifier(text: str):
+    t = text.strip()
+    if not t:
+        return {"sentiment": "neutral", "emotion": "neutral", "toxicity": 0, "reasons": []}
+
+    low = t.lower()
+    reasons = []
+    score = 0
+
+    # emojis
+    if any(e in t for e in EMOJI_POS): score += 3; reasons.append("positive emoji")
+    if any(e in t for e in EMOJI_NEG): score -= 4; reasons.append("negative emoji")
+    if any(e in t for e in EMOJI_MIX): reasons.append("mixed emoji")
+
+    # cues
+    pos_hits = [w for w in POS_CUES if w in low]
+    neg_hits = [w for w in NEG_CUES if w in low]
+    score += 2 * len(pos_hits) - 2.5 * len(neg_hits)
+    if pos_hits: reasons.append(f"+{','.join(pos_hits)}")
+    if neg_hits: reasons.append(f"-{','.join(neg_hits)}")
+
+    # slang
+    if any(w in low for w in SLANG_ABUSIVE):
+        reasons.append("abusive slang")
+        tox = 4
+        score -= 3
+    else:
+        tox = 0
+
+    # ALLCAPS boost anger
+    if re.search(r"[A-Z]{4,}", t):
+        score -= 1.5; reasons.append("ALLCAPS")
+
+    # punctuation intensity
+    exc = t.count("!")
+    if exc >= 2:
+        score -= 0.5; reasons.append("!!")
+
+    # map to classes
+    if score <= -3:
+        senti, emo = "negative", "angry"
+    elif score <= -1:
+        senti, emo = "negative", "disappointed"
+    elif score < 1:
+        senti, emo = "neutral", "neutral"
+    elif score < 3:
+        senti, emo = "positive", "satisfied"
+    else:
+        senti, emo = "positive", "delighted"
+
+    return {"sentiment": senti, "emotion": emo, "toxicity": tox, "reasons": reasons}
+
+def hf_classifier(text: str):
+    try:
+        out = clf(text)[0]  # list of dicts if top_k=None
+        # Expect format: list of {"label": "...", "score": ...} — adapt as needed
+        # We'll derive sentiment from labels; emotion coarse mapping
+        # If your model outputs "negative/neutral/positive"
+        labels = {d["label"].lower(): d["score"] for d in out}
+        sentiment = max(labels, key=labels.get) if labels else "neutral"
+        # crude emotion mapping
+        if sentiment == "negative":
+            emo = "angry" if "anger" in labels else "disappointed"
+        elif sentiment == "positive":
+            emo = "delighted"
+        else:
+            emo = "neutral"
+        return {"sentiment": sentiment, "emotion": emo, "toxicity": 0, "reasons": [f"model:{sentiment}"]}
+    except Exception as e:
+        return rule_classifier(text)
+
+# ========== Mood Gauge from typing + text ==========
+def update_typing_speed(txt: str):
     now = time.time()
-    txt = st.session_state.get("input_text","")
-    last = st.session_state.get("ts_meta", {"len":0, "t":now})
-    dt = max(0.25, now - last["t"])
-    cps = max(0.0, (len(txt) - last["len"])/dt)
-    st.session_state["ts_meta"] = {"len": len(txt), "t": now, "cps": cps}
+    meta = st.session_state.get("typing_meta", {"t": now, "n": 0, "cps": 0.0})
+    dt = max(0.25, now - meta["t"])
+    dn = max(0, len(txt) - meta["n"])
+    cps = dn / dt
+    st.session_state["typing_meta"] = {"t": now, "n": len(txt), "cps": cps}
+    arousal = int(min(100, (cps / 10.0) * 100))  # saturates at ~10 cps
+    return cps, arousal
 
-def cps_to_mood(cps):
-    # basic mapping
-    if cps < 3: return "Calm", 0.3
-    if cps < 6: return "Normal", 0.6
-    return "Stressed", 0.9
+def mood_score(model_energy: float, arousal_typing: int) -> int:
+    # model_energy: 0..1 prob mapped; here: positive/anger treated as high-energy; sad low
+    # We treat delighted/angry as high energy; neutral mid; sad/disappointed low.
+    return int(0.6 * (model_energy * 100) + 0.4 * arousal_typing)
 
-def gauge(value, label="Meter"):
-    # simple progress bar gauge
-    st.progress(min(100,int(value*100)), text=f"{label}: {int(value*100)}/100")
+def energy_from_emotion(emotion: str) -> float:
+    emotion = (emotion or "").lower()
+    if emotion in ("angry", "anger", "delighted", "joy", "excited"):
+        return 0.9
+    if emotion in ("satisfied", "happy"):
+        return 0.7
+    if emotion in ("neutral",):
+        return 0.5
+    if emotion in ("disappointed", "sad"):
+        return 0.25
+    return 0.5
 
-# --------------------------------------------
-# VOICE CAPTURE (live) + WAVEFORM
-# --------------------------------------------
-class AudioBuffer:
-    def __init__(self, max_seconds=10, sr=16000):
-        self.q = deque(maxlen=max_seconds*sr)
-        self.sr = sr
-    def add(self, pcm16):
-        # pcm16 is numpy int16 mono
-        self.q.extend(pcm16.tolist())
-    def wav_bytes(self):
-        import soundfile as sf
-        arr = np.array(self.q, dtype=np.int16)
-        bio = io.BytesIO()
-        if len(arr)==0:
-            return b""
-        sf.write(bio, arr, self.sr, format="WAV", subtype="PCM_16")
-        return bio.getvalue()
+# ========== HF Whisper transcription ==========
+HF_API_TOKEN = os.environ.get("HF_API_TOKEN") or st.secrets.get("HF_API_TOKEN", None)
+WHISPER_MODEL = "openai/whisper-small"  # can edit in sidebar
 
-def webrtc_audio_receiver_factory(shared_buf: AudioBuffer):
-    def recv(frame: av.AudioFrame) -> av.AudioFrame:
-        pcm = frame.to_ndarray().mean(axis=0).astype(np.int16)  # mono
-        shared_buf.add(pcm)
-        return frame
-    return recv
+def hf_whisper_transcribe(wav_bytes: bytes, model_name: str = WHISPER_MODEL, lang_hint: str | None = None) -> str:
+    if not HF_API_TOKEN:
+        raise RuntimeError("Missing HF_API_TOKEN secret.")
+    url = f"https://api-inference.huggingface.co/models/{model_name}"
+    headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+    # HF accepts: {"inputs": audio bytes} or raw bytes with headers; we'll send raw with params
+    params = {}
+    if lang_hint:
+        params["language"] = lang_hint
+    resp = requests.post(url, headers=headers, data=wav_bytes, params=params, timeout=90)
+    resp.raise_for_status()
+    js = resp.json()
+    # HF whisper returns list or dict depending on model; normalize
+    if isinstance(js, dict) and "text" in js:
+        return js["text"]
+    if isinstance(js, list) and len(js) and "text" in js[0]:
+        return js[0]["text"]
+    # fallback
+    return str(js)
 
-# --------------------------------------------
-# UI
-# --------------------------------------------
-st.title("🛵 Hybrid NLP (HF API) — Text + Voice + Dashboard")
+# ========== Mic capture helper ==========
+def frames_to_wav(frames, sample_rate=16000):
+    """Concatenate int16 mono pcm to WAV bytes."""
+    import soundfile as sf
+    pcm = b"".join(frames)
+    arr = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+    # write wav
+    buf = io.BytesIO()
+    sf.write(buf, arr, sample_rate, subtype="PCM_16", format="WAV")
+    return buf.getvalue()
 
-tabs = st.tabs(["📊 Dashboard", "✍️ Text Review", "🎙️ Voice Review", "📒 Logs"])
+# ========== UI ==========
+st.title("🛵 Delivery Mood — Text + Voice (Pan-India, Auto-Detect)")
 
-# Persistent store
-if "logs" not in st.session_state:
-    st.session_state.logs = []
+colA, colB = st.columns([1.2, 1])
 
-# ------------- TEXT REVIEW -------------
-with tabs[1]:
-    st.caption("Type even **1 word** — we auto-detect language (Indic & Roman) + slang + sentiment + emotion + toxicity.")
-    txt = st.text_input("Type your message", key="input_text", on_change=typing_speed_update)
-    typing_speed_update()
-    cps = st.session_state.get("ts_meta",{}).get("cps",0.0)
-    mood, mood_v = cps_to_mood(cps)
+# --- LEFT: Text Review with live language + mood ---
+with colA:
+    st.subheader("✍️ Text Review (auto language + mood)")
+    txt = st.text_area("Type here…", height=120, key="review_text")
+    # live language
+    lang = auto_language(txt)
+    st.caption(f"Detected language: **{lang.upper()}**" if lang != "und" else "Detected language: **UND**")
 
-    lang = detect_language(txt)
-    slang_hits, tox_from_slang = slang_scan(txt, lang_hint=lang)
-    clf = classify_text_all(txt)
+    # typing speed
+    cps, ar_typ = update_typing_speed(txt)
+    st.caption(f"Typing speed: **{cps:.1f} chars/sec**")
 
-    # Fuse toxicity with slang context
-    tox_final = "yes" if (tox_from_slang or clf["toxicity"][0]=="yes") else "no"
-
-    # Sentiment bar (simple)
-    sent_label, sent_score = clf["sentiment"]
-    em_label, em_score = clf["emotion"]
-
-    st.write("#### Live Meters")
-    c1,c2,c3,c4 = st.columns(4)
-    with c1: st.metric("Language", lang)
-    with c2: st.metric("Text Sentiment", f"{sent_label} ({int(sent_score*100)})")
-    with c3: st.metric("Dominant Emotion", em_label)
-    with c4: st.metric("Toxicity", "Yes" if tox_final=="yes" else "No")
-
-    gauge(mood_v, f"Typing Speed → {mood} ({cps:.1f} cps)")
-    st.progress( min(100, 50 if sent_label=="NEU" else (80 if sent_label=="POS" else 20)),
-                 text=f"Overall Tone • {em_label} • {int(sent_score*100)}/100")
-
-    if slang_hits:
-        st.warning("Slang detected (context-aware):")
-        st.dataframe(pd.DataFrame(slang_hits), use_container_width=True, hide_index=True)
+    # classify
+    if HF_MODEL_READY:
+        pred = hf_classifier(txt)
     else:
-        st.info("No slang detected.")
+        pred = rule_classifier(txt)
 
-    if st.button("Save as Latest Feedback → Dashboard"):
-        st.session_state.logs.append({
+    # energy & gauge
+    energy = energy_from_emotion(pred["emotion"])
+    gauge = mood_score(energy, ar_typ)
+
+    gcol1, gcol2, gcol3 = st.columns(3)
+    with gcol1: st.metric("Sentiment", pred["sentiment"].title())
+    with gcol2: st.metric("Emotion", pred["emotion"].title())
+    with gcol3: st.metric("Toxicity", pred["toxicity"])
+
+    st.progress(gauge, text=f"Mood Energy {gauge}/100")
+    if pred["reasons"]:
+        st.caption("Why: " + ", ".join(pred["reasons"][:6]))
+
+    # Save to dashboard
+    if st.button("➕ Add to Dashboard"):
+        oid = f"OD-{int(time.time())%100000}"
+        rec = {
             "time": datetime.now().strftime("%H:%M:%S"),
-            "modality": "text",
-            "text": txt,
+            "mode": "Text",
+            "order_id": oid,
             "lang": lang,
-            "sentiment": sent_label,
-            "emotion": em_label,
-            "toxicity": tox_final,
-            "cps": round(cps,1),
-            "slang_count": len(slang_hits)
-        })
-        st.success("Saved to Dashboard.")
+            "typing_cps": round(cps,1),
+            "sentiment": pred["sentiment"],
+            "emotion": pred["emotion"],
+            "toxicity": pred["toxicity"],
+            "mood_energy": gauge,
+            "snippet": (txt[:120] + "…") if len(txt) > 120 else txt
+        }
+        st.session_state.setdefault("orders", []).append(rec)
+        st.success(f"Added to dashboard: {oid}")
 
-# ------------- VOICE REVIEW -------------
-with tabs[2]:
-    st.caption("Click **Start**, speak for 5–8 seconds. Waveform animates live. Click **Transcribe & Analyze** to run Whisper + NLP.")
-    buf = AudioBuffer(max_seconds=12, sr=16000)
-
-    webrtc_ctx = webrtc_streamer(
-        key="live-voice",
-        mode=WebRtcMode.RECVONLY,
-        audio_receiver_size=1024,
-        rtc_configuration=RTC_CONFIG,
-        media_stream_constraints={"video": False, "audio": True},
-        async_processing=True,
-        on_audio_frame=webrtc_audio_receiver_factory(buf),
-    )
-
-    # Waveform preview
-    import plotly.graph_objects as go
-    samples = np.array(buf.q, dtype=np.int16)
-    if samples.size > 0:
-        seg = samples[-16000*3:]  # last 3s
-        x = np.arange(len(seg))/16000.0
-        fig = go.Figure(go.Scatter(y=seg, x=x, mode="lines"))
-        fig.update_layout(height=160, margin=dict(l=0,r=0,t=10,b=0), yaxis_title="Amp")
-        st.plotly_chart(fig, use_container_width=True)
-
-    colA, colB = st.columns([1,1])
-    with colA:
-        st.button("Start", help="Use the START in the grey mic panel (browser prompt).")
-    with colB:
-        if st.button("🧠 Transcribe & Analyze"):
-            if not HF_TOKEN:
-                st.error("Set HF_API_TOKEN in Streamlit Secrets to enable Whisper.")
-            else:
-                wav_bytes = buf.wav_bytes()
-                if not wav_bytes:
-                    st.error("No audio captured yet. Speak after pressing Start.")
-                else:
-                    with st.spinner("Transcribing..."):
-                        text = hf_asr_whisper(wav_bytes, 16000)
-                    st.text_area("Transcribed Text", value=text, height=100)
-                    # Run text pipeline
-                    lang = detect_language(text)
-                    slang_hits, tox_from_slang = slang_scan(text, lang_hint=lang)
-                    clf = classify_text_all(text)
-                    tox_final = "yes" if (tox_from_slang or clf["toxicity"][0]=="yes") else "no"
-                    sent_label, sent_score = clf["sentiment"]
-                    em_label, em_score = clf["emotion"]
-
-                    st.write("#### Voice Analysis")
-                    m1,m2,m3,m4 = st.columns(4)
-                    with m1: st.metric("Language", lang)
-                    with m2: st.metric("Sentiment", f"{sent_label} ({int(sent_score*100)})")
-                    with m3: st.metric("Emotion", em_label)
-                    with m4: st.metric("Toxicity", "Yes" if tox_final=="yes" else "No")
-
-                    if slang_hits:
-                        st.warning("Slang detected (context-aware):")
-                        st.dataframe(pd.DataFrame(slang_hits), use_container_width=True, hide_index=True)
-                    st.success("Voice result ready. Save to Dashboard if needed.")
-                    if st.button("Save Voice → Dashboard"):
-                        st.session_state.logs.append({
-                            "time": datetime.now().strftime("%H:%M:%S"),
-                            "modality": "voice",
-                            "text": text,
-                            "lang": lang,
-                            "sentiment": sent_label,
-                            "emotion": em_label,
-                            "toxicity": tox_final,
-                            "cps": None,
-                            "slang_count": len(slang_hits)
-                        })
-                        st.success("Saved to Dashboard.")
-
-# ------------- DASHBOARD -------------
-with tabs[0]:
-    st.caption("Latest saved items from Text/Voice.")
-    if st.session_state.logs:
-        df = pd.DataFrame(st.session_state.logs)
-        st.dataframe(df, use_container_width=True, hide_index=True)
-        # Small KPIs
-        pos = (df["sentiment"]=="POS").sum()
-        neg = (df["sentiment"]=="NEG").sum()
-        neu = (df["sentiment"]=="NEU").sum()
-        tox = (df["toxicity"]=="yes").sum()
-        c1,c2,c3,c4 = st.columns(4)
-        with c1: st.metric("POS", pos)
-        with c2: st.metric("NEG", neg)
-        with c3: st.metric("NEU", neu)
-        with c4: st.metric("Toxic", tox)
+# --- RIGHT: Voice (WebRTC mic -> HF Whisper) ---
+with colB:
+    st.subheader("🎙️ Voice Review (mic → Whisper → mood)")
+    if not HAS_WEBRTC:
+        st.info("Mic capture not available in this environment. Try file upload below or run locally.")
     else:
-        st.info("No items yet. Save from Text or Voice tabs.")
+        st.caption("Click **Start** to record. Speak for 4–8 seconds. Click **Stop**, then **Transcribe**.")
+        audio_frames = []
+        status_placeholder = st.empty()
 
-# ------------- LOGS -------------
-with tabs[3]:
-    st.json(st.session_state.logs)
+        def recv_audio(frame):
+            # frame is av.AudioFrame
+            pcm16 = frame.to_ndarray().astype(np.int16).tobytes()
+            audio_frames.append(pcm16)
+            return frame
+
+        webrtc_ctx = webrtc_streamer(
+            key="mic",
+            mode=WebRtcMode.RECVONLY,
+            audio_receiver_size=1024,
+            rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+            media_stream_constraints={"video": False, "audio": True},
+            async_processing=True,
+            on_audio_frame=recv_audio,
+        )
+
+        if webrtc_ctx and webrtc_ctx.state.playing:
+            status_placeholder.info("🎤 Recording… speak now")
+
+        trans_txt = st.text_area("Transcript (editable):", height=100, key="voice_transcript")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("📝 Transcribe (HF Whisper)"):
+                try:
+                    wav_bytes = frames_to_wav(audio_frames, sample_rate=16000)
+                    hint = auto_language(trans_txt) if trans_txt.strip() else None
+                    text = hf_whisper_transcribe(wav_bytes, WHISPER_MODEL, lang_hint=hint)
+                    st.session_state["voice_transcript"] = text
+                    st.success("Transcribed!")
+                    st.session_state["voice_last"] = text
+                except Exception as e:
+                    st.error(f"Transcription failed: {e}")
+        with c2:
+            if st.button("⟲ Use last transcript"):
+                text = st.session_state.get("voice_last", "")
+                if text:
+                    st.session_state["voice_transcript"] = text
+                else:
+                    st.info("No previous transcript yet.")
+
+        # show updated transcript text area
+        if "voice_transcript" in st.session_state:
+            st.session_state["voice_transcript"] = st.text_area(
+                "Transcript (editable):", value=st.session_state["voice_transcript"], height=100)
+
+        # analyze transcript
+        text_for_nlp = st.session_state.get("voice_transcript", "").strip()
+        if text_for_nlp:
+            vlang = auto_language(text_for_nlp)
+            if HF_MODEL_READY:
+                vpred = hf_classifier(text_for_nlp)
+            else:
+                vpred = rule_classifier(text_for_nlp)
+            v_energy = mood_score(energy_from_emotion(vpred["emotion"]), arousal_typing=60)  # medium arousal for voice
+            vc1, vc2, vc3 = st.columns(3)
+            with vc1: st.metric("Lang", vlang.upper())
+            with vc2: st.metric("Emotion", vpred["emotion"].title())
+            with vc3: st.metric("Toxicity", vpred["toxicity"])
+            st.progress(v_energy, text=f"Mood Energy {v_energy}/100")
+            if vpred["reasons"]:
+                st.caption("Why: " + ", ".join(vpred["reasons"][:6]))
+
+            if st.button("➕ Add to Dashboard (Voice)"):
+                oid = f"OD-{int(time.time())%100000}"
+                rec = {
+                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "mode": "Voice",
+                    "order_id": oid,
+                    "lang": vlang,
+                    "typing_cps": None,
+                    "sentiment": vpred["sentiment"],
+                    "emotion": vpred["emotion"],
+                    "toxicity": vpred["toxicity"],
+                    "mood_energy": v_energy,
+                    "snippet": (text_for_nlp[:120] + "…") if len(text_for_nlp) > 120 else text_for_nlp
+                }
+                st.session_state.setdefault("orders", []).append(rec)
+                st.success(f"Added to dashboard: {oid}")
+        else:
+            st.caption("No transcript yet.")
+
+st.markdown("---")
+st.subheader("👷 Delivery Boy Dashboard")
+orders = st.session_state.get("orders", [])
+if orders:
+    # High priority = Angry/Disappointed or high toxicity
+    def priority(o):
+        if o["toxicity"] >= 3 or o["emotion"] in ("angry", "disappointed"):
+            return "High"
+        return "Normal"
+
+    rows = []
+    for o in orders:
+        rows.append({
+            "⏰ Time": o["time"],
+            "Mode": o["mode"],
+            "OrderID": o["order_id"],
+            "Lang": o["lang"].upper() if o["lang"] else "UND",
+            "Typing (cps)": o["typing_cps"] if o["typing_cps"] is not None else "—",
+            "Sentiment": o["sentiment"].title(),
+            "Emotion": o["emotion"].title(),
+            "Toxicity": o["toxicity"],
+            "Priority": priority(o),
+            "Mood": o["mood_energy"],
+            "Snippet": o["snippet"],
+        })
+    df = pd.DataFrame(rows)
+    df = df.sort_values(by=["Priority","Mood"], ascending=[True, False])
+    st.dataframe(df, hide_index=True, use_container_width=True)
+else:
+    st.info("No entries yet. Add from Text or Voice panels above.")
