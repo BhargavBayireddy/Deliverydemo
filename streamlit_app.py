@@ -1,354 +1,317 @@
-import os, io, time, math, re, json, queue, threading
-from collections import deque
-from datetime import datetime
+# -*- coding: utf-8 -*-
+# Hybrid NLP (HF API) — Text + Voice
+# - Language detection: fastText lid.176 (works for romanized/“chat” text)
+# - Voice: WebRTC -> Whisper (HF Inference API) -> transcript + language
+# - Mood: lightweight lexicon/rules -> score (-100..+100) + gauge
+# - UI: Tabs (Dashboard, Text Review, Voice Review, Logs)
 
+import os, io, time, re, json, tempfile, requests, pathlib
 import numpy as np
-import pandas as pd
-import requests
 import streamlit as st
-from scipy.signal import get_window
-from scipy.io import wavfile
 
-from streamlit_webrtc import webrtc_streamer, WebRtcMode
+# Optional: mic capture (web)
+try:
+    from streamlit_webrtc import webrtc_streamer, WebRtcMode
+    import av
+    HAS_WEBRTC = True
+except Exception:
+    HAS_WEBRTC = False
 
-# ----------------------------- CONFIG ---------------------------------
-APP_TITLE = "Hybrid NLP (HF API) — Text + Voice Feedback"
-HEADS_UP  = "Heads up: your order may be late by ~5 minutes. Sorry!"
+# ---------- Settings ----------
+HF_ASR_MODEL = "openai/whisper-small"     # HuggingFace Inference API
+FASTTEXT_URL = "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin"
+MODEL_DIR = pathlib.Path("./models")
+MODEL_DIR.mkdir(exist_ok=True, parents=True)
+FT_BIN = MODEL_DIR / "lid.176.bin"
 
-# HF Inference API (set in Streamlit Secrets or env)
-HF_TOKEN = st.secrets.get("HF_API_TOKEN", os.getenv("HF_API_TOKEN", ""))
-ASR_MODEL = os.getenv("HF_ASR_MODEL", st.secrets.get("HF_ASR_MODEL", "Systran/faster-whisper-large-v3"))
-EMO_MODEL = os.getenv("HF_EMO_MODEL", st.secrets.get("HF_EMO_MODEL", "j-hartmann/emotion-english-distilroberta-base"))
-SENT_MODEL = os.getenv("HF_SENT_MODEL", st.secrets.get("HF_SENT_MODEL", "cardiffnlp/twitter-roberta-base-sentiment-latest"))
+st.set_page_config(page_title="Hybrid NLP (HF API) — Text + Voice", page_icon="🛵", layout="wide")
 
-# Live transcription chunking (seconds)
-CHUNK_SEC = 2.0
-SAMPLE_RATE = 16000    # we standardize captured audio to 16k mono
+# ---------- Small utilities ----------
+def human_lang_name(code: str) -> str:
+    # Minimal, high-coverage mapping; unknown -> code
+    m = {
+        "en":"English","hi":"Hindi","te":"Telugu","ta":"Tamil","kn":"Kannada","ml":"Malayalam",
+        "mr":"Marathi","bn":"Bengali","gu":"Gujarati","pa":"Punjabi","or":"Odia","ur":"Urdu",
+        "ne":"Nepali","si":"Sinhala","as":"Assamese","sd":"Sindhi",
+        "fr":"French","es":"Spanish","de":"German","it":"Italian","pt":"Portuguese","ru":"Russian",
+        "ar":"Arabic","tr":"Turkish","id":"Indonesian","ms":"Malay","vi":"Vietnamese",
+        "zh":"Chinese","ja":"Japanese","ko":"Korean","fa":"Persian","ps":"Pashto"
+    }
+    return m.get(code, code or "unknown")
 
-# -------------------------- LANGUAGE DETECTION -------------------------
-# Fast script-based detection for major Indian languages, then langid fallback.
-SCRIPT_RANGES = {
-    "hi": (0x0900, 0x097F),   # Hindi / Devanagari
-    "bn": (0x0980, 0x09FF),   # Bengali
-    "pa": (0x0A00, 0x0A7F),   # Punjabi (Gurmukhi)
-    "gu": (0x0A80, 0x0AFF),   # Gujarati
-    "or": (0x0B00, 0x0B7F),   # Odia
-    "ta": (0x0B80, 0x0BFF),   # Tamil
-    "te": (0x0C00, 0x0C7F),   # Telugu
-    "kn": (0x0C80, 0x0CFF),   # Kannada
-    "ml": (0x0D00, 0x0D7F),   # Malayalam
-    "si": (0x0D80, 0x0DFF),   # Sinhala
+@st.cache_resource(show_spinner=False)
+def load_fasttext():
+    # Try import fasttext; if build fails (some hosts), fall back to fasttext-wheel package name
+    try:
+        import fasttext
+    except Exception:
+        import importlib
+        fasttext = importlib.import_module("fasttext")
+    # Ensure model file
+    if not FT_BIN.exists():
+        try:
+            r = requests.get(FASTTEXT_URL, timeout=60)
+            r.raise_for_status()
+            FT_BIN.write_bytes(r.content)
+        except Exception as e:
+            st.error("Failed to download fastText lid.176 model.")
+            raise e
+    model = fasttext.load_model(str(FT_BIN))
+    return model
+
+FT = load_fasttext()
+
+# Romanized/“chat” keyword boosts (very small lists; extend as needed)
+ROMA_HINTS = {
+    "te": {"entha","sepu","cheyyali","inka","ayyindi","ivvandi","babu","anna","ra","pls","fast ga"},
+    "hi": {"kya","kaise","kyu","bahut","mast","jaldi","yar","yaar","nahi","krdo","jaldi se"},
+    "ta": {"enna","epdi","venum","seri","romba","sapadu","sapten","da","machan","machaa"},
+    "kn": {"yenu","swalpa","tumba","ondhu","hegidde","banni"},
+    "ml": {"entha","cheyyu","vannu","kitti","alle"},
 }
 
-def detect_script_lang(s: str):
-    for lang, (start, end) in SCRIPT_RANGES.items():
-        if any(start <= ord(ch) <= end for ch in s):
-            return lang
-    return None
+def detect_lang_fasttext(text: str):
+    """Return (lang_code, prob, name). Works for romanized text; adds keyword boosts."""
+    clean = (text or "").strip()
+    if not clean:
+        return "unknown", 0.0, "unknown"
+    labels, probs = FT.predict(clean.replace("\n"," "), k=1)
+    code = labels[0].replace("__label__", "")
+    prob = float(probs[0])
 
-@st.cache_data(show_spinner=False)
-def load_langid():
-    import langid
-    return langid
+    # Boost for romanized Indic when fastText is unsure (<0.75)
+    if prob < 0.75:
+        low = clean.lower()
+        for iso, hints in ROMA_HINTS.items():
+            if any(h in low for h in hints):
+                # soft override if the winner isn't already the same language
+                code = iso
+                prob = max(prob, 0.85)
+                break
 
-def detect_lang(text: str) -> str:
-    text = text.strip()
-    if not text:
-        return "und"
-    script_lang = detect_script_lang(text)
-    if script_lang:
-        return script_lang
-    try:
-        langid = load_langid()
-        return langid.classify(text)[0]
-    except Exception:
-        return "und"
+    return code, prob, human_lang_name(code)
 
-# --------------------------- SIMPLE TEXT NLP ---------------------------
-# Light, multilingual-ish sentiment with lexicons + emojis.
-INTENS = {"very":1.3,"really":1.2,"so":1.2,"too":1.15,"extremely":1.4,"super":1.3,
-          "bahut":1.2,"chala":1.2,"bahuthi":1.25,"inka":1.15,"romba":1.2}
-NEGS = set(["not","no","never","hardly","barely","nahi","mat","kadu","illa","illae"])
-POSW = set("""
-good great awesome amazing excellent tasty fresh fast quick ontime polite friendly
-love liked perfect nice yummy delicious wow clean crisp juicy superb thanks
-mast semma mass superr bagundi super
-""".split())
-NEGW = set("""
-bad terrible awful worst cold soggy late delay delayed dirty slow rude stale raw burnt
-bland overpriced expensive missing leak leaking spilled refund replace cancel canceled cancelled
-angry frustrated annoyed disappointed hate horrible issue problem broken uncooked inedible
-vomit sick hair bekar bakwas mosam chindi pathetic useless trash
-""".split())
+# --------- Mood (rule-based) ----------
+NEG = {
+    "late","delay","waiting","slow","bad","worst","rude","cold","soggy","stale","refund","cancel",
+    "bekar","bakwas","chindi","waste","problem","issue","hate","angry","frustrated","disappointed",
+    # romanized
+    "entha","sepu","cheyyali","inka","ayyindi","bahut bura","bahut late","romba late","venum asap"
+}
+POS = {"good","great","awesome","amazing","excellent","tasty","fresh","fast","quick","polite","love",
+       "perfect","nice","yummy","delicious","super","mast","semma","satisfying","hot","crispy","clean"}
 
-def text_sentiment(text: str):
-    t = text.strip()
-    if not t: 
-        return 0, "Neutral", "😐", []
-    s = re.sub(r"[^\w\s!?]", " ", t.lower())
-    words = s.split()
-    score = 0.0; hits=[]
-    exclam = t.count("!")
+def sentiment_score(text: str) -> tuple[int,str,str]:
+    t = (text or "").strip()
+    if not t:
+        return 0,"Neutral","😐"
+    low = t.lower()
+    ex = t.count("!")
     caps = 1.15 if re.search(r"[A-Z]{3,}", t) else 1.0
-    long = 1.1 if re.search(r"(.)\1{2,}", t.lower()) else 1.0
-    score *= caps*long
-    if exclam>=2: score*=1.1
-    for i,w in enumerate(words):
-        base=(2.5 if w in POSW else 0)+(-2.5 if w in NEGW else 0)
-        if base!=0:
-            if i>0 and words[i-1] in INTENS: base*=INTENS[words[i-1]]
-            # simple negation window
-            for k in range(1,4):
-                if i-k>=0 and words[i-k] in NEGS: base*=-1; break
-            score+=base; hits.append(w)
-    raw=max(-40,min(40,score)); scaled=int(round((raw/40)*100))
-    if   scaled<=-60: mood,emoji="Angry","😡"
-    elif scaled<=-30: mood,emoji="Frustrated","😠"
-    elif scaled<=-6:  mood,emoji="Disappointed","😕"
-    elif -5<=scaled<=5: mood,emoji="Neutral","😐"
-    elif scaled<=35:  mood,emoji="Satisfied","🙂"
-    else:             mood,emoji="Delighted","🤩"
-    return scaled,mood,emoji,list(dict.fromkeys(hits))
 
-def mood_to_score(mood: str) -> int:
-    mapping = {
-        "Angry":10, "Frustrated":25, "Disappointed":40,
-        "Neutral":50, "Satisfied":75, "Delighted":95,
-        "Angry/Stress":20, "Sad":35, "Joy":85
-    }
-    return mapping.get(mood, 50)
+    score = 0
+    # simple token-wise scoring
+    for w in re.findall(r"[a-zA-Z]+", low):
+        if w in POS: score += 6
+        if w in NEG: score -= 8
+    # emojis
+    if any(x in t for x in ["😡","🤬"]): score -= 20
+    if any(x in t for x in ["😊","🙂","😄","😍","🤩","👍","👏"]): score += 16
 
-# ------------------------- HUGGINGFACE HELPERS ------------------------
-HF_URL = "https://api-inference.huggingface.co/models"
+    score = int(np.clip((score* caps + ex*2), -100, 100))
+    if score <= -60: mood, emoji = "Angry", "😡"
+    elif score <= -30: mood, emoji = "Frustrated", "😠"
+    elif score <= -6: mood, emoji = "Disappointed", "😕"
+    elif score <= 5: mood, emoji = "Neutral", "😐"
+    elif score <= 40: mood, emoji = "Satisfied", "🙂"
+    else: mood, emoji = "Delighted", "🤩"
+    return score, mood, emoji
 
+def gauge_bar(score: int, label: str):
+    # score -100..100 -> 0..100 bar
+    val = int(np.interp(score, [-100,100],[0,100]))
+    st.progress(val, text=f"{label} • {val}/100")
+
+# -------- Whisper (HF Inference API) ----------
 def hf_headers():
-    if not HF_TOKEN:
-        return {}
-    return {"Authorization": f"Bearer {HF_TOKEN}"}
+    tok = os.getenv("HF_API_TOKEN", "")
+    headers = {"Accept": "application/json"}
+    if tok: headers["Authorization"] = f"Bearer {tok}"
+    return headers
 
-def hf_whisper_transcribe(wav_bytes: bytes, task_lang: str | None = None) -> str:
+def whisper_transcribe(wav_bytes: bytes):
     """
-    Send audio bytes (wav 16k mono recommended) to Whisper on HF Inference API.
-    Returns transcribed text ("" on failure).
+    Send audio to HF Whisper. Returns dict {text, language?, raw} or raises.
     """
-    if not HF_TOKEN:
-        return ""
-    url = f"{HF_URL}/{ASR_MODEL}"
-    opts = {"task": "transcribe"}
-    if task_lang and task_lang != "und":
-        opts["language"] = task_lang
-    try:
-        resp = requests.post(
-            url, headers=hf_headers(),
-            data=wav_bytes, params={"wait_for_model": "true"},
-            timeout=60
-        )
-        if resp.status_code == 200:
-            js = resp.json()
-            # HF returns {"text": "..."} OR list of chunks
-            if isinstance(js, dict) and "text" in js:
-                return js["text"]
-            if isinstance(js, list) and len(js) and "text" in js[0]:
-                return " ".join([c.get("text","") for c in js])
-        return ""
-    except Exception:
-        return ""
+    url = f"https://api-inference.huggingface.co/models/{HF_ASR_MODEL}"
+    r = requests.post(url, headers=hf_headers(), data=wav_bytes, timeout=60)
+    r.raise_for_status()
+    js = r.json()
+    # HF whisper returns single dict or a list (space for different repos); normalize
+    if isinstance(js, list) and js and isinstance(js[0], dict):
+        js = js[0]
+    text = js.get("text") or ""
+    # Some servers include "language" key (ISO)
+    lang = js.get("language")
+    return {"text": text, "language": lang, "raw": js}
 
-# ------------------------- STREAMING AUDIO BUFFER ----------------------
-class LiveAudioBuffer:
-    def __init__(self, sr=SAMPLE_RATE, chunk_sec=CHUNK_SEC):
-        self.sr = sr
-        self.chunk_len = int(sr * chunk_sec)
-        self.buf = deque(maxlen=self.chunk_len * 4)
-        self.last_flush = time.time()
+def pcm16_to_wav(pcm16: bytes, sample_rate: int = 16000) -> bytes:
+    import wave, struct
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)  # 16-bit
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm16)
+    return buf.getvalue()
 
-    def add_frame(self, frame_ndarray):
-        # frame_ndarray is int16 or float; standardize to float32 mono
-        if frame_ndarray.ndim == 2:
-            x = frame_ndarray.mean(axis=0)
-        else:
-            x = frame_ndarray
-        if x.dtype != np.float32:
-            x = x.astype(np.float32) / 32768.0
-        self.buf.extend(x.tolist())
-
-    def pop_chunk_wav(self):
-        if len(self.buf) < self.chunk_len:
-            return None
-        # take exactly a chunk
-        arr = np.array([self.buf.popleft() for _ in range(self.chunk_len)], dtype=np.float32)
-        # pack to wav 16k
-        mem = io.BytesIO()
-        wavfile.write(mem, SAMPLE_RATE, arr)
-        return mem.getvalue()
-
-# ------------------------ STREAMLIT PAGE LAYOUT -----------------------
-st.set_page_config(page_title=APP_TITLE, page_icon="🛵", layout="wide")
-
-st.title(f"🛵 {APP_TITLE}")
-st.info(HEADS_UP)
-if not HF_TOKEN:
-    st.warning("⚠️ Set **HF_API_TOKEN** in Settings → Secrets for ASR & emotion models.", icon="⚠️")
-
-if "orders" not in st.session_state:
-    st.session_state.orders=[]
+# ----------- UI / State -----------
 if "logs" not in st.session_state:
-    st.session_state.logs=[]
-if "live_text" not in st.session_state:
-    st.session_state.live_text=""
-if "live_lang" not in st.session_state:
-    st.session_state.live_lang="und"
-if "live_mood" not in st.session_state:
-    st.session_state.live_mood=("Neutral","😐",50)
+    st.session_state.logs = []
 
-tabs = st.tabs(["📊 Dashboard", "✍️ Text Review", "🎙️ Voice Review", "🗒️ Logs"])
+st.title("🧪 Hybrid NLP (HF API) — Text + Voice")
+st.caption("Auto detects language, sentiment & emotion from text and live voice. Uses fastText (176-langs) and Whisper (HF API).")
 
-# ---------------------------- DASHBOARD TAB ---------------------------
+if not os.getenv("HF_API_TOKEN"):
+    st.warning("⚠️ Set **HF_API_TOKEN** in your environment / Streamlit Secrets to enable Whisper ASR.", icon="⚠️")
+
+tabs = st.tabs(["📊 Dashboard","✍️ Text Review","🎙️ Voice Review","🧾 Logs"])
+
+# ------------- Dashboard -------------
 with tabs[0]:
-    col1,col2 = st.columns([1.2,1])
-    with col1:
-        st.subheader("Live Mood")
-        mood, emoji, score = st.session_state.live_mood
-        gauge = st.progress(score, text=f"{emoji} {mood} • {score}/100")
-        # animate lightly (no-op update to reflect)
-        time.sleep(0.05)
-        gauge.progress(score, text=f"{emoji} {mood} • {score}/100")
+    st.subheader("Recent Items")
+    if not st.session_state.logs:
+        st.info("No events yet. Use *Text Review* or *Voice Review* to add entries.")
+    else:
+        for item in reversed(st.session_state.logs[-12:]):
+            with st.container(border=True):
+                st.markdown(f"**Time:** {item['time']}  •  **Source:** {item['src']}")
+                st.markdown(f"**Language:** {human_lang_name(item['lang'])}  ({item['lang_conf']:.2f})")
+                st.markdown(f"**Text:** {item['text']}")
+                gauge_bar(item["score"], f"{item['emoji']} {item['mood']}")
+                st.caption(json.dumps(item.get("extra", {}), ensure_ascii=False))
 
-        st.caption(f"Live language: **{st.session_state.live_lang}**")
-        st.text_area("Live transcript (from mic)", value=st.session_state.live_text, height=120)
-
-    with col2:
-        st.subheader("Recent Orders (priority by mood)")
-        orders=list(st.session_state.orders)
-        if orders:
-            orders.sort(key=lambda o: (0 if o["priority"]=="High" else 1, o["eta"]))
-            df=pd.DataFrame([{
-                "Time":o["time"],"Platform":o["platform"],"Order":o["order_id"],
-                "ETA(min)":o["eta"],"Priority":o["priority"],"Mood":f"{o['emoji']} {o['mood']}"
-            } for o in orders])
-            st.dataframe(df, hide_index=True, use_container_width=True)
-        else:
-            st.info("No active drops yet.")
-
-# ---------------------------- TEXT TAB --------------------------------
+# ------------- Text Review -------------
 with tabs[1]:
     st.subheader("Review (auto detects language while you type)")
-    txt = st.text_input("Type your message", placeholder="e.g., entha late avuthundi, I'm waiting…", key="txtbox")
+    txt = st.text_input("Type your message", value="", placeholder="e.g., 'entra babu entha sepu wait cheyyali'")
+    lang, conf, lname = "unknown", 0.0, "unknown"
+    if txt:
+        code, prob, lname = detect_lang_fasttext(txt)
+        lang, conf = code, prob
+        score, mood, emoji = sentiment_score(txt)
+        gauge_bar(score, f"{emoji} {mood}")
+        col1, col2, col3 = st.columns(3)
+        with col1: st.metric("Language", f"{lname}")
+        with col2: st.metric("Text Sentiment", f"{score} ({emoji} {mood})")
+        with col3:
+            tox = "Yes" if any(w in txt.lower() for w in ["abuse","idiot","stupid","bhosd","madarch"]) else "No"
+            st.metric("Toxicity", tox)
 
-    # detect language & sentiment
-    lang = detect_lang(txt) if txt else "und"
-    score,mood,emoji,hits = text_sentiment(txt)
+        if st.button("Save as Latest Feedback → Dashboard", type="primary"):
+            st.session_state.logs.append({
+                "time": time.strftime("%H:%M:%S"),
+                "src": "text",
+                "text": txt,
+                "lang": lang,
+                "lang_conf": conf,
+                "score": score,
+                "mood": mood,
+                "emoji": emoji,
+                "extra": {"detected_language": lname}
+            })
+            st.success("Saved to dashboard.")
 
-    # mood gauge
-    gscore = int(np.interp(score, [-100,100],[0,100])) if isinstance(score,(int,float)) else mood_to_score(mood)
-    st.session_state.live_mood = (mood, emoji, gscore)
-    st.session_state.live_lang = lang
-
-    g = st.progress(gscore, text=f"{emoji} {mood} • {gscore}/100")
-    time.sleep(0.03); g.progress(gscore, text=f"{emoji} {mood} • {gscore}/100")
-
-    c1,c2,c3 = st.columns(3)
-    with c1: st.metric("Language", lang)
-    with c2: st.metric("Text Sentiment", f"{score} ({emoji} {mood})")
-    with c3: st.metric("Toxicity", "No" if mood not in ["Angry","Frustrated"] else "Possible")
-
-    if hits:
-        st.caption("Triggers: " + ", ".join(hits))
-
-    # (Optional) add to rider dashboard
-    if st.button("Save as Latest Feedback → Dashboard"):
-        oid=f"OD-{int(time.time())%100000}"
-        st.session_state.orders.append({
-            "time":datetime.now().strftime("%H:%M:%S"),
-            "platform":"Zomato","order_id":oid,"eta":5.0,
-            "priority":"High" if mood in ["Angry","Frustrated","Disappointed"] else "Normal",
-            "mood":mood,"emoji":emoji
-        })
-        st.success("Saved to dashboard.")
-
-# ---------------------------- VOICE TAB -------------------------------
+# ------------- Voice Review -------------
 with tabs[2]:
     st.subheader("Live Voice (auto language via Whisper)")
+    st.caption("Click **Start**, allow microphone, speak for 5–8 seconds. Processing runs automatically.")
+    if not HAS_WEBRTC:
+        st.error("Mic capture not available in this environment. Try locally or on HTTPS.")
+    else:
+        # Simple RECVONLY mic; we just read a few frames, then process when user clicks 'Transcribe'
+        ctx = webrtc_streamer(
+            key="voice-demo",
+            mode=WebRtcMode.RECVONLY,
+            rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
+            media_stream_constraints={"video": False, "audio": True},
+        )
+        if "voice_pcm" not in st.session_state:
+            st.session_state.voice_pcm = b""
 
-    st.caption("Click **Start**, allow mic, speak 5–8 seconds. Live subtitles update every ~2 seconds.")
-    stt_placeholder = st.empty()
-    mood_placeholder = st.empty()
+        def pull_audio_frames(max_ms=6000):
+            """Read ~N ms from receiver; return concatenated PCM16 bytes."""
+            if not ctx or not ctx.state.playing or not ctx.audio_receiver:
+                return b""
+            pcm = []
+            ms_total = 0
+            start = time.time()
+            while ms_total < max_ms and (time.time()-start) < 7.5:
+                try:
+                    frame = ctx.audio_receiver.get_frame(timeout=1.0)
+                except Exception:
+                    frame = None
+                if frame is None:
+                    continue
+                if isinstance(frame, av.AudioFrame):
+                    # Convert to mono 16k PCM16
+                    f = frame.to_ndarray(format="s16", layout="mono")
+                    pcm.append(f.tobytes())
+                    ms_total += int(1000 * frame.samples / frame.sample_rate)
+            return b"".join(pcm)
 
-    audio_buffer = LiveAudioBuffer(sr=SAMPLE_RATE, chunk_sec=CHUNK_SEC)
-    text_q = queue.Queue()
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("🎤 Capture 6s"):
+                st.session_state.voice_pcm = pull_audio_frames(max_ms=6000)
+                if st.session_state.voice_pcm:
+                    st.success("Captured ~6s voice. Click **Transcribe & Analyze**.")
+                else:
+                    st.warning("No audio captured. Make sure mic permission is allowed.")
+        with c2:
+            if st.button("🧠 Transcribe & Analyze", type="primary"):
+                if not st.session_state.voice_pcm:
+                    st.error("No captured audio. Click 'Capture 6s' first.")
+                else:
+                    wav = pcm16_to_wav(st.session_state.voice_pcm, 16000)
+                    try:
+                        out = whisper_transcribe(wav)
+                        transcript = out.get("text", "").strip()
+                        wh_lang = out.get("language")
+                        # Language: use Whisper's language if present else fastText on transcript
+                        if wh_lang:
+                            lang_code = wh_lang
+                            conf = 0.90
+                        else:
+                            lang_code, conf, _ = detect_lang_fasttext(transcript)
+                        # Mood on transcript
+                        score, mood, emoji = sentiment_score(transcript)
+                        gauge_bar(score, f"{emoji} {mood}")
 
-    def asr_worker():
-        # background thread: pull chunks and call HF Whisper
-        while True:
-            wav_bytes = text_q.get()
-            if wav_bytes is None:
-                break
-            # language from current text box / script to assist ASR
-            asr_lang = st.session_state.live_lang
-            text = hf_whisper_transcribe(wav_bytes, task_lang=asr_lang)
-            if text:
-                # Update transcript & mood immediately
-                st.session_state.live_text += (" " if st.session_state.live_text else "") + text
-                # detect language again from new transcript
-                st.session_state.live_lang = detect_lang(text)
-                # mood from text (voice-only prosody omitted to keep cloud-lite)
-                s,m,e,hits = text_sentiment(text)
-                gscore = int(np.interp(s, [-100,100],[0,100]))
-                st.session_state.live_mood = (m,e,gscore)
+                        st.markdown(f"**Transcript:** {transcript or '(empty)'}")
+                        st.markdown(f"**Language:** {human_lang_name(lang_code)}  (conf ~ {conf:.2f})")
 
-    # Start background thread
-    worker_thread = threading.Thread(target=asr_worker, daemon=True)
-    worker_thread.start()
+                        # Save to dashboard
+                        st.session_state.logs.append({
+                            "time": time.strftime("%H:%M:%S"),
+                            "src": "voice",
+                            "text": transcript,
+                            "lang": lang_code,
+                            "lang_conf": conf,
+                            "score": score,
+                            "mood": mood,
+                            "emoji": emoji,
+                            "extra": {"whisper": out.get("raw", {})}
+                        })
+                        st.success("Saved to dashboard.")
+                    except Exception as e:
+                        st.exception(e)
 
-    def audio_frame_callback(frame):
-        # frame: av.AudioFrame -> numpy
-        pcm = frame.to_ndarray()  # shape (channels, samples)
-        if pcm.ndim == 2:
-            pcm = pcm.mean(axis=0)  # mono
-        audio_buffer.add_frame(pcm)
-        # every CHUNK_SEC, create wav and enqueue for ASR
-        now = time.time()
-        if len(audio_buffer.buf) >= audio_buffer.chunk_len and (now - audio_buffer.last_flush) >= CHUNK_SEC:
-            wav_bytes = audio_buffer.pop_chunk_wav()
-            audio_buffer.last_flush = now
-            if wav_bytes:
-                text_q.put(wav_bytes)
-        return frame
-
-    ctx = webrtc_streamer(
-        key="live-voice",
-        mode=WebRtcMode.RECVONLY,
-        audio_receiver_size=1024,
-        media_stream_constraints={"video": False, "audio": True},
-        rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
-        audio_frame_callback=audio_frame_callback,
-    )
-
-    # live UI refresh
-    if ctx.state.playing:
-        stt_placeholder.text_area("Live transcript", value=st.session_state.live_text, height=140)
-        m,e,gs = st.session_state.live_mood
-        mood_placeholder.progress(gs, text=f"{e} {m} • {gs}/100")
-
-    # stop worker cleanly on page rerun
-    if not ctx.state.playing:
-        try:
-            text_q.put_nowait(None)
-        except Exception:
-            pass
-
-# ---------------------------- LOGS TAB --------------------------------
+# ------------- Logs -------------
 with tabs[3]:
-    st.subheader("System Log")
-    st.write(f"- HF Token set: **{bool(HF_TOKEN)}**")
-    st.write(f"- ASR Model: `{ASR_MODEL}`")
-    st.write(f"- Emotion Model: `{EMO_MODEL}`")
-    st.write(f"- Sentiment Model: `{SENT_MODEL}`")
-    st.write(f"- Chunk size: **{CHUNK_SEC}s**, Sample rate: **{SAMPLE_RATE} Hz**")
-    st.caption("This page is for debugging configuration during demos.")
-
-    if st.button("Clear transcript"):
-        st.session_state.live_text=""
-        st.success("Cleared.")
-
-# --------------------------- END OF FILE -------------------------------
+    st.subheader("Raw Log (latest first)")
+    if not st.session_state.logs:
+        st.info("No logs yet.")
+    else:
+        for item in reversed(st.session_state.logs[-20:]):
+            st.code(json.dumps(item, ensure_ascii=False, indent=2))
